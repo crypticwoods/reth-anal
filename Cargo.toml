@@ -1,0 +1,13 @@
+[package]
+name = "reth-anal"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = "4.5.3"
+futures-util = "0.3.30"
+
+reth = { git = "https://github.com/paradigmxyz/reth", rev = "ac29b4b73be382caf2a2462d426e6bad75e18af9" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "ac29b4b73be382caf2a2462d426e6bad75e18af9" }

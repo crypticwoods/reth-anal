@@ -68,6 +68,7 @@ fn main() {
 
             // Provider clone
             let provider = node.provider.clone();
+            let txpool = node.pool.clone();
 
             // Simple KV store to denote if transactions are seen in the mempool
             // Not querying from mempool as once the block is updated, it'll be removed
@@ -86,6 +87,9 @@ fn main() {
                     // Stores the transaction hash into the KV store
                     let mut guard = seen_txs_mempool.lock().await;
                     guard.insert(*tx_hash, true);
+
+                    // Remove the transaction from the txpool so we dun max it out lol
+                    txpool.remove_transactions(vec![*tx_hash]);
                 }
             }));
 

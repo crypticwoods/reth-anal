@@ -1,31 +1,66 @@
 use clap::Parser;
 use futures_util::StreamExt;
-use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+use jsonrpsee::{
+    core::RpcResult,
+    proc_macros::rpc,
+    types::{error::UNKNOWN_ERROR_CODE, ErrorObjectOwned},
+};
 use reth::{
-    builder::NodeHandle, cli::Cli, dirs::{DataDirPath, MaybePlatformPath, PlatformPath}, primitives::BlockNumberOrTag, providers::{BlockNumReader, BlockReaderIdExt, CanonStateSubscriptions, ChainSpecProvider}, revm::primitives::FixedBytes, transaction_pool::TransactionPool
+    builder::NodeHandle,
+    cli::Cli,
+    primitives::{hex::ToHexExt, BlockNumber, BlockNumberOrTag},
+    providers::{BlockReaderIdExt, CanonStateSubscriptions},
+    revm::primitives::FixedBytes,
+    transaction_pool::TransactionPool,
 };
 use reth_node_ethereum::node::EthereumNode;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct BlockPrivy {
+    pub number: BlockNumber,
+    pub public_txs: Vec<String>,
+    pub private_txs: Vec<String>,
+}
 
 fn main() {
     Cli::<RethAnalCliExt>::parse()
         .run(|builder, args| async move {
+            // Get sqlite3 db location
+            let db_path = builder.data_dir().data_dir_path();
+            let db_anal_sqlite3 = db_path.join(args.anal_db).clone();
+            let db_anal_sqlite3 = db_anal_sqlite3.as_path();
+            let sqlite_conn = Connection::open(db_anal_sqlite3).unwrap();
+            sqlite_conn.execute(
+                "CREATE TABLE IF NOT EXISTS tx_privy (
+                    number INTEGER PRIMARY KEY,
+                    public_txs TEXT,
+                    private_txs TEXT
+                )",
+                [],
+            )?;
 
             // launch the node
+            let sqlite_conn_arc = Arc::new(Mutex::new(sqlite_conn));
+            let sqlite_conn_ext = sqlite_conn_arc.clone();
             let NodeHandle {
                 node,
                 node_exit_future,
-            } = builder.node(EthereumNode::default()).launch().await?;
-
-            // ChainInfo
-            let chain_spec= node.provider.chain_spec();
-
-            // Get sqlite3 db location
-            let db_path = PlatformPath::<DataDirPath>::default().with_chain(chain_spec.chain).data_dir_path();
-            let db_anal_sqlite3 = db_path.join(args.anal_db).clone();
-            let db_anal_sqlite3 = db_anal_sqlite3.as_path();
-            tracing::info!("DB Anal sqlite3 {:?}", db_anal_sqlite3);
+            } = builder
+                .node(EthereumNode::default())
+                .extend_rpc_modules(move |ctx| {
+                    let ext = RethAnalExt {
+                        provider: ctx.provider().clone(),
+                        sqlite_conn: sqlite_conn_ext.clone(),
+                    };
+                    ctx.modules.merge_configured(ext.into_rpc())?;
+                    Ok(())
+                })
+                .launch()
+                .await?;
 
             // create a new subscription to pending transactions and new canon state
             let mut pending_transactions = node.pool.new_pending_pool_transactions_listener();
@@ -34,8 +69,9 @@ fn main() {
             // Provider clone
             let provider = node.provider.clone();
 
-
             // Simple KV store to denote if transactions are seen in the mempool
+            // Not querying from mempool as once the block is updated, it'll be removed
+            // from the pending mempool
             let seen_txs: Arc<Mutex<HashMap<FixedBytes<32>, bool>>> =
                 Arc::new(Mutex::new(HashMap::new()));
 
@@ -55,6 +91,7 @@ fn main() {
 
             // On new canon state, just update everything (dont care if its a reorg or commit)
             let seen_txs_canon = seen_txs.clone();
+            let sqlite_conn_inserter = sqlite_conn_arc.clone();
             node.task_executor.spawn(Box::pin(async move {
                 while let Ok(_) = canon_state_notifications.recv().await {
                     if let Ok(Some(latest_block)) = provider
@@ -62,29 +99,44 @@ fn main() {
                         .block_by_number_or_tag(BlockNumberOrTag::Latest)
                     {
                         // Compares with the list of transactions we've seen
+                        let block_number = latest_block.number.to_string();
                         let body = latest_block.body;
 
-                        let mut public_txs: Vec<FixedBytes<32>> = Vec::new();
-                        let mut private_txs: Vec<FixedBytes<32>> = Vec::new();
+                        let mut public_txs: Vec<String> = Vec::new();
+                        let mut private_txs: Vec<String> = Vec::new();
 
                         // Unblock guard and then saves the public txs
-                        let guard = seen_txs_canon.lock().await;
+                        let mut guard = seen_txs_canon.lock().await;
                         for tx in body.iter() {
                             let cur_hash = tx.hash();
                             if guard.contains_key(&cur_hash) {
-                                public_txs.push(cur_hash);
+                                // Remove txhash (no memory leak)
+                                guard.remove(&cur_hash);
+
+                                public_txs.push(cur_hash.encode_hex_with_prefix());
                             } else {
-                                private_txs.push(cur_hash);
+                                private_txs.push(cur_hash.encode_hex_with_prefix());
                             }
                         }
 
                         // Save to sqlite3
+                        let guard = sqlite_conn_inserter.lock().await;
+                        // Delete block if it already exists
+                        let _ = guard.execute("DELETE FROM tx_privy WHERE number = ?", params![block_number]);
+
+                        // Insert new block into sqlite3
+                        let public_txs = public_txs.join(",");
+                        let private_txs = private_txs.join(",");
+
+                        let _ = guard.execute(
+                        "INSERT INTO tx_privy (number, public_txs, private_txs) VALUES (?1, ?2, ?3)",
+                            params![block_number, public_txs, private_txs],
+                        );
                     }
                 }
             }));
 
             tracing::info!("Reth Analyzer enabled");
-
             node_exit_future.await
         })
         .unwrap();
@@ -99,18 +151,138 @@ struct RethAnalCliExt {
 
 // Trait for the new namespace + method
 #[cfg_attr(not(test), rpc(server, namespace = "anal"))]
-#[cfg_attr(test, rpc(server, namespace = "anal"))]
+#[cfg_attr(test, rpc(server, client, namespace = "anal"))]
 pub trait RethAnalExtApi {
-    /// Returns the number of transactions in the pool.
-    #[method(name = "blockTxConfidentiality")]
-    fn block_tx_confidentiality(&self) -> RpcResult<usize>;
+    #[method(name = "getBlockTxPrivyByNumber")]
+    async fn get_block_tx_privy_by_number(&self, bn: BlockNumberOrTag) -> RpcResult<BlockPrivy>;
 }
 
-/// The type that implements the `txpool` rpc namespace trait
-pub struct RethAnalExt {}
+pub struct RethAnalExt<Provider> {
+    pub provider: Provider,
+    pub sqlite_conn: Arc<Mutex<Connection>>,
+}
 
-impl RethAnalExtApiServer for RethAnalExt {
-    fn block_tx_confidentiality(&self) -> RpcResult<usize> {
-        return Ok(0);
+#[async_trait::async_trait]
+impl<Provider> RethAnalExtApiServer for RethAnalExt<Provider>
+where
+    Provider: BlockReaderIdExt + Clone + Unpin + 'static,
+{
+    async fn get_block_tx_privy_by_number(&self, bn: BlockNumberOrTag) -> RpcResult<BlockPrivy> {
+        let conn = self.sqlite_conn.lock().await;
+
+        let mut stmt = conn
+            .prepare("SELECT number, public_txs, private_txs FROM tx_privy WHERE number = ?")
+            .unwrap();
+
+        let bn = match bn.is_number() {
+            true => bn.as_number().unwrap(),
+            false => match self.provider.last_block_number() {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(ErrorObjectOwned::owned(
+                        UNKNOWN_ERROR_CODE,
+                        e.to_string(),
+                        None::<()>,
+                    ));
+                }
+            },
+        };
+
+        let mut privy_iter = stmt
+            .query_map([bn], |row| {
+                let number: u64 = row.get(0)?;
+
+                let public_txs: String = row.get(1)?;
+                let public_txs: Vec<&str> = public_txs.split(",").collect();
+                let public_txs = public_txs.into_iter().map(|x| x.to_string()).collect();
+
+                let private_txs: String = row.get(2)?;
+                let private_txs: Vec<&str> = private_txs.split(",").collect();
+                let private_txs = private_txs.into_iter().map(|x| x.to_string()).collect();
+
+                Ok(BlockPrivy {
+                    number,
+                    public_txs,
+                    private_txs,
+                })
+            })
+            .map_err(|x| ErrorObjectOwned::owned(UNKNOWN_ERROR_CODE, x.to_string(), None::<()>))?;
+
+        if let Some(Ok(result)) = privy_iter.next() {
+            return Ok(result);
+        }
+
+        return Ok(BlockPrivy {
+            number: bn,
+            public_txs: Vec::new(),
+            private_txs: Vec::new(),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sql() {
+        let db = Connection::open_in_memory().unwrap();
+
+        let _ = db
+            .execute(
+                "CREATE TABLE IF NOT EXISTS tx_privy (
+                number INTEGER PRIMARY KEY,
+                public_txs TEXT,
+                private_txs TEXT
+            )",
+                [],
+            )
+            .unwrap();
+
+        let _ = db
+            .execute(
+                "INSERT INTO tx_privy (number, public_txs, private_txs) VALUES (?1, ?2, ?3)",
+                params![1, "0x1,0x2,0x3", "0x5,0x6,0x7"],
+            )
+            .unwrap();
+
+        let _ = db
+            .execute("DELETE FROM tx_privy WHERE number = ?", params![1])
+            .unwrap();
+
+        let _ = db
+            .execute(
+                "INSERT INTO tx_privy (number, public_txs, private_txs) VALUES (?1, ?2, ?3)",
+                params![1, "0x1,0x2,0x3", "0x5,0x6,0x7"],
+            )
+            .unwrap();
+
+        let mut stmt = db
+            .prepare("SELECT number, public_txs, private_txs FROM tx_privy WHERE number = ?")
+            .unwrap();
+
+        let mut privy_iter = stmt
+            .query_map([1], |row| {
+                let number: u64 = row.get(0)?;
+
+                let public_txs: String = row.get(1)?;
+                let public_txs: Vec<&str> = public_txs.split(",").collect();
+                let public_txs = public_txs.into_iter().map(|x| x.to_string()).collect();
+
+                let private_txs: String = row.get(2)?;
+                let private_txs: Vec<&str> = private_txs.split(",").collect();
+                let private_txs = private_txs.into_iter().map(|x| x.to_string()).collect();
+
+                Ok(BlockPrivy {
+                    number,
+                    public_txs,
+                    private_txs,
+                })
+            })
+            .unwrap();
+
+        let result = privy_iter.next().unwrap().unwrap();
+
+        println!("privy_iter {:?}", result);
     }
 }

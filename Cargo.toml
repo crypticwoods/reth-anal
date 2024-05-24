@@ -8,6 +8,11 @@ edition = "2021"
 [dependencies]
 clap = "4.5.3"
 futures-util = "0.3.30"
+tracing = "0.1.40"
+tokio = { version = "1.21", features = ["full"] }
+jsonrpsee = { version = "0.20", features = ["server", "macros"] }
+jsonrpsee-core = { version = "0.20" }
 
 reth = { git = "https://github.com/paradigmxyz/reth", rev = "ac29b4b73be382caf2a2462d426e6bad75e18af9" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "ac29b4b73be382caf2a2462d426e6bad75e18af9" }
 reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "ac29b4b73be382caf2a2462d426e6bad75e18af9" }

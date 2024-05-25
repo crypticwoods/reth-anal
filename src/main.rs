@@ -7,8 +7,10 @@ use jsonrpsee::{
 use reth::{
     builder::NodeHandle,
     cli::Cli,
-    primitives::{hex::ToHexExt, BlockNumber, BlockNumberOrTag},
-    providers::{BlockNumReader, BlockReaderIdExt, CanonStateSubscriptions},
+    primitives::{hex::ToHexExt, BlockNumber, BlockNumberOrTag, SealedBlock},
+    providers::{
+        BlockNumReader, BlockReaderIdExt, CanonStateNotification, CanonStateSubscriptions,
+    },
     revm::primitives::FixedBytes,
     transaction_pool::TransactionPool,
 };
@@ -66,7 +68,6 @@ fn main() {
             let mut canon_state_listener = node.provider.subscribe_to_canonical_state();
 
             // Provider clone
-            let provider = node.provider.clone();
             let txpool = node.pool.clone();
 
             // Simple KV store to denote if transactions are seen in the mempool
@@ -97,14 +98,24 @@ fn main() {
             let seen_txs_canon = seen_txs.clone();
             let sqlite_conn_inserter = sqlite_conn_arc.clone();
             node.task_executor.spawn(Box::pin(async move {
-                while let Ok(_) = canon_state_listener.recv().await {
-                    if let Ok(block_number) = provider
-                        .clone().best_block_number()
-                    {
-                        let block = match provider.block_by_number_or_tag(BlockNumberOrTag::Number(block_number)) {
-                            Ok(Some(b)) => b,
-                            _ => continue
-                        };
+                while let Ok(e) = canon_state_listener.recv().await {
+                    let mut blocks: Vec<SealedBlock> = Vec::new();
+
+                    match e {
+                        CanonStateNotification::Commit { new } =>{
+                            for (_, v) in new.blocks().into_iter() {
+                                blocks.push(v.block.clone());
+                            }
+                        },
+                        CanonStateNotification::Reorg { old: _, new } => {
+                            for (_, v) in new.blocks().into_iter() {
+                                blocks.push(v.block.clone());
+                            }
+                        },
+                    };
+
+                    for block in blocks {
+                        let block_number = block.number;
                         let body = block.body;
 
                         let mut public_txs: Vec<String> = Vec::new();

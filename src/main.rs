@@ -216,11 +216,11 @@ where
             return Ok(result);
         }
 
-        return Ok(BlockPrivy {
-            number: bn,
-            public_txs: Vec::new(),
-            private_txs: Vec::new(),
-        });
+        return Err(ErrorObjectOwned::owned(
+            UNKNOWN_ERROR_CODE,
+            "block not indexed",
+            None::<()>,
+        ));
     }
 }
 

@@ -62,8 +62,8 @@ fn main() {
                 .launch()
                 .await?;
 
-            // create a new subscription to pending transactions and new canon state
-            let mut pending_transactions = node.pool.new_pending_pool_transactions_listener();
+            // create a new subscription to transactions and new canon state
+            let mut pending_transactions = node.pool.new_transactions_listener();
             let mut canon_state_notifications = node.provider.subscribe_to_canonical_state();
 
             // Provider clone
@@ -80,7 +80,7 @@ fn main() {
             let seen_txs_mempool = seen_txs.clone();
             node.task_executor.spawn(Box::pin(async move {
                 // Waiting for new transactions
-                while let Some(event) = pending_transactions.next().await {
+                while let Some(event) = pending_transactions.recv().await {
                     let tx = event.transaction;
                     let tx_hash = tx.hash();
 

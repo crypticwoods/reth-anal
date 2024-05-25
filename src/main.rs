@@ -1,5 +1,4 @@
 use clap::Parser;
-use futures_util::StreamExt;
 use jsonrpsee::{
     core::RpcResult,
     proc_macros::rpc,
@@ -9,7 +8,7 @@ use reth::{
     builder::NodeHandle,
     cli::Cli,
     primitives::{hex::ToHexExt, BlockNumber, BlockNumberOrTag},
-    providers::{BlockReaderIdExt, CanonStateSubscriptions},
+    providers::{BlockNumReader, BlockReaderIdExt, CanonStateSubscriptions},
     revm::primitives::FixedBytes,
     transaction_pool::TransactionPool,
 };
@@ -63,8 +62,8 @@ fn main() {
                 .await?;
 
             // create a new subscription to transactions and new canon state
-            let mut pending_transactions = node.pool.new_transactions_listener();
-            let mut canon_state_notifications = node.provider.subscribe_to_canonical_state();
+            let mut tx_listener= node.pool.new_transactions_listener();
+            let mut canon_state_listener = node.provider.subscribe_to_canonical_state();
 
             // Provider clone
             let provider = node.provider.clone();
@@ -80,13 +79,14 @@ fn main() {
             let seen_txs_mempool = seen_txs.clone();
             node.task_executor.spawn(Box::pin(async move {
                 // Waiting for new transactions
-                while let Some(event) = pending_transactions.recv().await {
+                while let Some(event) = tx_listener.recv().await {
                     let tx = event.transaction;
                     let tx_hash = tx.hash();
 
                     // Stores the transaction hash into the KV store
                     let mut guard = seen_txs_mempool.lock().await;
                     guard.insert(*tx_hash, true);
+                    drop(guard);
 
                     // Remove the transaction from the txpool so we dun max it out lol
                     txpool.remove_transactions(vec![*tx_hash]);
@@ -97,14 +97,15 @@ fn main() {
             let seen_txs_canon = seen_txs.clone();
             let sqlite_conn_inserter = sqlite_conn_arc.clone();
             node.task_executor.spawn(Box::pin(async move {
-                while let Ok(_) = canon_state_notifications.recv().await {
-                    if let Ok(Some(latest_block)) = provider
-                        .clone()
-                        .block_by_number_or_tag(BlockNumberOrTag::Latest)
+                while let Ok(_) = canon_state_listener.recv().await {
+                    if let Ok(block_number) = provider
+                        .clone().best_block_number()
                     {
-                        // Compares with the list of transactions we've seen
-                        let block_number = latest_block.number.to_string();
-                        let body = latest_block.body;
+                        let block = match provider.block_by_number_or_tag(BlockNumberOrTag::Number(block_number)) {
+                            Ok(Some(b)) => b,
+                            _ => continue
+                        };
+                        let body = block.body;
 
                         let mut public_txs: Vec<String> = Vec::new();
                         let mut private_txs: Vec<String> = Vec::new();
@@ -122,6 +123,7 @@ fn main() {
                                 private_txs.push(cur_hash.encode_hex_with_prefix());
                             }
                         }
+                        drop(guard);
 
                         // Save to sqlite3
                         let guard = sqlite_conn_inserter.lock().await;

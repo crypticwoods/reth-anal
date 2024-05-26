@@ -67,9 +67,6 @@ fn main() {
             let mut tx_listener= node.pool.new_transactions_listener();
             let mut canon_state_listener = node.provider.subscribe_to_canonical_state();
 
-            // Provider clone
-            let txpool = node.pool.clone();
-
             // Simple KV store to denote if transactions are seen in the mempool
             // Not querying from mempool as once the block is updated, it'll be removed
             // from the pending mempool
@@ -88,9 +85,6 @@ fn main() {
                     let mut guard = seen_txs_mempool.lock().await;
                     guard.insert(*tx_hash, true);
                     drop(guard);
-
-                    // Remove the transaction from the txpool so we dun max it out lol
-                    txpool.remove_transactions(vec![*tx_hash]);
                 }
             }));
 

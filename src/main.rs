@@ -65,20 +65,16 @@ fn main() {
             // create a new subscription to transactions and new canon state
             let mut tx_listener = node.pool.all_transactions_event_listener();
             let mut canon_state_listener = node.provider.subscribe_to_canonical_state();
-
-            // Simple KV store to denote if transactions are seen in the mempool
-            // Not querying from mempool as once the block is updated, it'll be removed
-            // from the pending mempool
-            let seen_txs: Arc<Mutex<HashMap<FixedBytes<32>, bool>>> =
-                Arc::new(Mutex::new(HashMap::new()));
-
-            // Listens to mempool transactions and saves them to KV
-            let seen_txs_mempool = seen_txs.clone();
-
-            // On new canon state, just update everything (dont care if its a reorg or commit)
-            let seen_txs_canon = seen_txs.clone();
             let sqlite_conn_inserter = sqlite_conn_arc.clone();
             node.task_executor.spawn(Box::pin(async move {
+                // Simple KV store to denote if transactions are seen in the mempool
+                // Not querying from mempool as once the block is updated, it'll be removed
+                // from the pending mempool
+                let mut seen_txs = HashMap::new();
+
+                // Clone txpool
+                let txpool = node.pool.clone();
+
                 loop {
                     select! {
                         // New transaction listener
@@ -97,9 +93,7 @@ fn main() {
                                     };
 
                                     // Stores the transaction hash into the KV store
-                                    let mut guard = seen_txs_mempool.lock().await;
-                                    guard.insert(tx_hash, true);
-                                    drop(guard);
+                                    seen_txs.insert(tx_hash, true);
                                 }
                                 _ => {},
                             }
@@ -133,19 +127,17 @@ fn main() {
                                         let mut private_txs: Vec<String> = Vec::new();
 
                                         // Unblock guard and then saves the public txs
-                                        let mut guard = seen_txs_canon.lock().await;
                                         for tx in body.iter() {
                                             let cur_hash = tx.hash();
-                                            if guard.contains_key(&cur_hash) {
+                                            if seen_txs.contains_key(&cur_hash) {
                                                 // Remove txhash (no memory leak)
-                                                guard.remove(&cur_hash);
+                                                seen_txs.remove(&cur_hash);
 
                                                 public_txs.push(cur_hash.encode_hex_with_prefix());
                                             } else {
                                                 private_txs.push(cur_hash.encode_hex_with_prefix());
                                             }
                                         }
-                                        drop(guard);
 
                                         // Save to sqlite3
                                         let guard = sqlite_conn_inserter.lock().await;
@@ -160,6 +152,16 @@ fn main() {
                                         "INSERT INTO tx_privy (number, public_txs, private_txs) VALUES (?1, ?2, ?3)",
                                             params![block_number, public_txs, private_txs],
                                         );
+
+                                        // Every 10 blocks, remove all queued txs to free up space
+                                        if block_number % 10 == 0 {
+                                            let queued_txs = txpool.queued_transactions();
+                                            let mut queued_tx_hashes = Vec::new();
+                                            for tx in queued_txs.iter() {
+                                                queued_tx_hashes.push(*tx.hash())
+                                            }
+                                            txpool.remove_transactions(queued_tx_hashes);
+                                        }
                                     }
                                 },
                                 _ => {},

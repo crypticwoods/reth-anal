@@ -8,13 +8,12 @@ use jsonrpsee::{
 use reth::{
     builder::NodeHandle,
     cli::Cli,
-    primitives::{hex::ToHexExt, transaction, BlockNumber, BlockNumberOrTag, SealedBlock},
+    primitives::{hex::ToHexExt, BlockNumber, BlockNumberOrTag, SealedBlock},
     providers::{
-        BlockNumReader, BlockReaderIdExt, CanonStateNotification, CanonStateSubscriptions,
+        BlockReaderIdExt, CanonStateNotification, CanonStateSubscriptions,
     },
     revm::primitives::FixedBytes,
-    rpc::types::txpool,
-    transaction_pool::{FullTransactionEvent, TransactionPool, TransactionPoolExt},
+    transaction_pool::{FullTransactionEvent, TransactionPool},
 };
 use reth_node_ethereum::node::EthereumNode;
 use rusqlite::{params, Connection};

@@ -1,4 +1,5 @@
 use clap::Parser;
+use futures_util::StreamExt;
 use jsonrpsee::{
     core::RpcResult,
     proc_macros::rpc,
@@ -7,12 +8,13 @@ use jsonrpsee::{
 use reth::{
     builder::NodeHandle,
     cli::Cli,
-    primitives::{hex::ToHexExt, BlockNumber, BlockNumberOrTag, SealedBlock},
+    primitives::{hex::ToHexExt, transaction, BlockNumber, BlockNumberOrTag, SealedBlock},
     providers::{
         BlockNumReader, BlockReaderIdExt, CanonStateNotification, CanonStateSubscriptions,
     },
     revm::primitives::FixedBytes,
-    transaction_pool::TransactionPool,
+    rpc::types::txpool,
+    transaction_pool::{FullTransactionEvent, TransactionPool, TransactionPoolExt},
 };
 use reth_node_ethereum::node::EthereumNode;
 use rusqlite::{params, Connection};
@@ -64,7 +66,7 @@ fn main() {
                 .await?;
 
             // create a new subscription to transactions and new canon state
-            let mut tx_listener= node.pool.new_transactions_listener();
+            let mut tx_listener= node.pool.all_transactions_event_listener();
             let mut canon_state_listener = node.provider.subscribe_to_canonical_state();
 
             // Simple KV store to denote if transactions are seen in the mempool
@@ -77,13 +79,23 @@ fn main() {
             let seen_txs_mempool = seen_txs.clone();
             node.task_executor.spawn(Box::pin(async move {
                 // Waiting for new transactions
-                while let Some(event) = tx_listener.recv().await {
-                    let tx = event.transaction;
-                    let tx_hash = tx.hash();
+                while let Some(event) = tx_listener.next().await {
+                    let tx_hash = match event {
+                        FullTransactionEvent::Pending(tx_hash) => {
+                            tx_hash
+                        },
+                        FullTransactionEvent::Queued(tx_hash) => {tx_hash},
+                        FullTransactionEvent::Replaced{replaced_by, ..} => {replaced_by},
+                        FullTransactionEvent::Discarded(tx_hash) => {tx_hash},
+                        FullTransactionEvent::Invalid(tx_hash) => {tx_hash},
+                        _ => {
+                            continue;
+                        },
+                    };
 
                     // Stores the transaction hash into the KV store
                     let mut guard = seen_txs_mempool.lock().await;
-                    guard.insert(*tx_hash, true);
+                    guard.insert(tx_hash, true);
                     drop(guard);
                 }
             }));
@@ -108,6 +120,7 @@ fn main() {
                         },
                     };
 
+                    // Sync
                     for block in blocks {
                         let block_number = block.number;
                         let body = block.body;

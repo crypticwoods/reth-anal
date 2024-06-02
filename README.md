@@ -32,5 +32,7 @@ cargo run -- node --rpc-max-connections 128 \
     --datadir /home/ubuntu/.ethereum/reth \
     --http --http.addr 0.0.0.0 --http.api=admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots \
     --ws --ws.addr 0.0.0.0 --ws.api=admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots \
-    --authrpc.jwtsecret /home/ubuntu/.eth2-jwtsecret --authrpc.addr 127.0.0.1 --authrpc.port 8551 --txpool.pending-max-size 500 --txpool.pending-max-count 100000
+    --authrpc.jwtsecret /home/ubuntu/.eth2-jwtsecret --authrpc.addr 127.0.0.1 --authrpc.port 8551 \
+    --txpool.pending-max-size 500 --txpool.pending-max-count 100000 \
+    --txpool.queued-max-count 64
 ```

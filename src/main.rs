@@ -9,9 +9,7 @@ use reth::{
     builder::NodeHandle,
     cli::Cli,
     primitives::{hex::ToHexExt, BlockNumber, BlockNumberOrTag, SealedBlock},
-    providers::{
-        BlockReaderIdExt, CanonStateNotification, CanonStateSubscriptions,
-    },
+    providers::{BlockReaderIdExt, CanonStateNotification, CanonStateSubscriptions},
     revm::primitives::FixedBytes,
     transaction_pool::{FullTransactionEvent, TransactionPool},
 };
@@ -19,7 +17,7 @@ use reth_node_ethereum::node::EthereumNode;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::{select, sync::Mutex};
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct BlockPrivy {
@@ -65,7 +63,7 @@ fn main() {
                 .await?;
 
             // create a new subscription to transactions and new canon state
-            let mut tx_listener= node.pool.all_transactions_event_listener();
+            let mut tx_listener = node.pool.all_transactions_event_listener();
             let mut canon_state_listener = node.provider.subscribe_to_canonical_state();
 
             // Simple KV store to denote if transactions are seen in the mempool
@@ -76,93 +74,104 @@ fn main() {
 
             // Listens to mempool transactions and saves them to KV
             let seen_txs_mempool = seen_txs.clone();
-            node.task_executor.spawn(Box::pin(async move {
-                // Waiting for new transactions
-                while let Some(event) = tx_listener.next().await {
-                    let tx_hash = match event {
-                        FullTransactionEvent::Pending(tx_hash) => {
-                            tx_hash
-                        },
-                        FullTransactionEvent::Queued(tx_hash) => {tx_hash},
-                        FullTransactionEvent::Replaced{replaced_by, ..} => {replaced_by},
-                        FullTransactionEvent::Discarded(tx_hash) => {tx_hash},
-                        FullTransactionEvent::Invalid(tx_hash) => {tx_hash},
-                        _ => {
-                            continue;
-                        },
-                    };
-
-                    // Stores the transaction hash into the KV store
-                    let mut guard = seen_txs_mempool.lock().await;
-                    guard.insert(tx_hash, true);
-                    drop(guard);
-                }
-            }));
 
             // On new canon state, just update everything (dont care if its a reorg or commit)
             let seen_txs_canon = seen_txs.clone();
             let sqlite_conn_inserter = sqlite_conn_arc.clone();
             node.task_executor.spawn(Box::pin(async move {
-                while let Ok(e) = canon_state_listener.recv().await {
-                    let mut blocks: Vec<SealedBlock> = Vec::new();
+                loop {
+                    select! {
+                        // New transaction listener
+                        maybe_tx_event = tx_listener.next() => {
+                            match maybe_tx_event {
+                                Some(tx_event) => {
+                                    let tx_hash = match tx_event {
+                                        FullTransactionEvent::Pending(tx_hash) => tx_hash,
+                                        FullTransactionEvent::Queued(tx_hash) => tx_hash,
+                                        FullTransactionEvent::Replaced { replaced_by, .. } => replaced_by,
+                                        FullTransactionEvent::Discarded(tx_hash) => tx_hash,
+                                        FullTransactionEvent::Invalid(tx_hash) => tx_hash,
+                                        _ => {
+                                            continue;
+                                        }
+                                    };
 
-                    match e {
-                        CanonStateNotification::Commit { new } =>{
-                            for (_, v) in new.blocks().into_iter() {
-                                blocks.push(v.block.clone());
+                                    // Stores the transaction hash into the KV store
+                                    let mut guard = seen_txs_mempool.lock().await;
+                                    guard.insert(tx_hash, true);
+                                    drop(guard);
+                                }
+                                _ => {},
                             }
                         },
-                        CanonStateNotification::Reorg { old: _, new } => {
-                            for (_, v) in new.blocks().into_iter() {
-                                blocks.push(v.block.clone());
-                            }
-                        },
-                    };
 
-                    // Sync
-                    for block in blocks {
-                        let block_number = block.number;
-                        let body = block.body;
+                        // New block listener
+                        result = canon_state_listener.recv() => {
+                            match result {
+                                Ok(e) => {
+                                    let mut blocks: Vec<SealedBlock> = Vec::new();
 
-                        let mut public_txs: Vec<String> = Vec::new();
-                        let mut private_txs: Vec<String> = Vec::new();
+                                    match e {
+                                        CanonStateNotification::Commit { new } =>{
+                                            for (_, v) in new.blocks().into_iter() {
+                                                blocks.push(v.block.clone());
+                                            }
+                                        },
+                                        CanonStateNotification::Reorg { old: _, new } => {
+                                            for (_, v) in new.blocks().into_iter() {
+                                                blocks.push(v.block.clone());
+                                            }
+                                        },
+                                    };
 
-                        // Unblock guard and then saves the public txs
-                        let mut guard = seen_txs_canon.lock().await;
-                        for tx in body.iter() {
-                            let cur_hash = tx.hash();
-                            if guard.contains_key(&cur_hash) {
-                                // Remove txhash (no memory leak)
-                                guard.remove(&cur_hash);
+                                    // Sync
+                                    for block in blocks {
+                                        let block_number = block.number;
+                                        let body = block.body;
 
-                                public_txs.push(cur_hash.encode_hex_with_prefix());
-                            } else {
-                                private_txs.push(cur_hash.encode_hex_with_prefix());
+                                        let mut public_txs: Vec<String> = Vec::new();
+                                        let mut private_txs: Vec<String> = Vec::new();
+
+                                        // Unblock guard and then saves the public txs
+                                        let mut guard = seen_txs_canon.lock().await;
+                                        for tx in body.iter() {
+                                            let cur_hash = tx.hash();
+                                            if guard.contains_key(&cur_hash) {
+                                                // Remove txhash (no memory leak)
+                                                guard.remove(&cur_hash);
+
+                                                public_txs.push(cur_hash.encode_hex_with_prefix());
+                                            } else {
+                                                private_txs.push(cur_hash.encode_hex_with_prefix());
+                                            }
+                                        }
+                                        drop(guard);
+
+                                        // Save to sqlite3
+                                        let guard = sqlite_conn_inserter.lock().await;
+                                        // Delete block if it already exists
+                                        let _ = guard.execute("DELETE FROM tx_privy WHERE number = ?", params![block_number]);
+
+                                        // Insert new block into sqlite3
+                                        let public_txs = public_txs.join(",");
+                                        let private_txs = private_txs.join(",");
+
+                                        let _ = guard.execute(
+                                        "INSERT INTO tx_privy (number, public_txs, private_txs) VALUES (?1, ?2, ?3)",
+                                            params![block_number, public_txs, private_txs],
+                                        );
+                                    }
+                                },
+                                _ => {},
                             }
                         }
-                        drop(guard);
-
-                        // Save to sqlite3
-                        let guard = sqlite_conn_inserter.lock().await;
-                        // Delete block if it already exists
-                        let _ = guard.execute("DELETE FROM tx_privy WHERE number = ?", params![block_number]);
-
-                        // Insert new block into sqlite3
-                        let public_txs = public_txs.join(",");
-                        let private_txs = private_txs.join(",");
-
-                        let _ = guard.execute(
-                        "INSERT INTO tx_privy (number, public_txs, private_txs) VALUES (?1, ?2, ?3)",
-                            params![block_number, public_txs, private_txs],
-                        );
                     }
                 }
             }));
 
             tracing::info!("Reth Analyzer enabled");
             node_exit_future.await
-        })
-        .unwrap();
+        }).unwrap();
 }
 
 #[derive(Debug, Clone, Default, clap::Args)]

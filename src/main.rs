@@ -10,7 +10,6 @@ use reth::{
     cli::Cli,
     primitives::{hex::ToHexExt, BlockNumber, BlockNumberOrTag, SealedBlock},
     providers::{BlockReaderIdExt, CanonStateNotification, CanonStateSubscriptions},
-    revm::primitives::FixedBytes,
     transaction_pool::{FullTransactionEvent, TransactionPool},
 };
 use reth_node_ethereum::node::EthereumNode;
